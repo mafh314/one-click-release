@@ -1,0 +1,19 @@
+apiVersion: tekton.dev/v1beta1
+kind: StepAction
+metadata:
+  name: install-dependencies
+spec:
+  volumeMounts:
+    - name: shared-bin-dir
+      mountPath: /shared-bin
+    - name: github-secret-volume
+      mountPath: /etc/github
+      readOnly: true
+
+  params:
+    - name: IMAGE
+      default: "quay.io/openshift-pipeline/ci"
+
+  image:  $(params.IMAGE)
+  script: |
+    echo "Hello"

@@ -1,0 +1,130 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: apply-konflux-config-task
+  annotations:
+    tekton.dev/tags: release
+spec:
+  params:
+    - name: RELEASE
+      type: string
+  stepTemplate:
+    image: quay.io/openshift-pipeline/ci
+    env:
+      - name: RELEASE
+        value: $(params.RELEASE)
+  steps:
+    - name: get-release-plan
+      script: |
+        APPLICATION="$APPLICATION-${RELEASE//./-}"
+        export RELEASE_PLAN=$(
+          oc get releaseplan -o json | jq -r --arg APP $APPLICATION --arg ENVX $ENVIRONMENT '
+          [
+           .items[]
+           | select(.spec.application == $APP and (.metadata.name | contains($ENVX)))
+           |.metadata.name
+          ]
+          |.[-1]'
+        )
+        echo -n "$RELEASE_PLAN" | tee $(results.release-plan.path)
+
+    - name: get-latest-snapshot
+      script: |
+        set -x
+        APPLICATION="$APPLICATION-${RELEASE//./-}"
+
+        LATEST_SNAPSHOT=$(
+        kubectl get snapshots \
+          -l "pac.test.appstudio.openshift.io/event-type=push,appstudio.openshift.io/application=${APPLICATION}" \
+          --sort-by=.metadata.creationTimestamp \
+          -o jsonpath='{.items[*].metadata.name}' | awk '{print $NF}')
+
+        echo -n "$LATEST_SNAPSHOT" | tee $(results.snapshot.path)
+
+    - name: create-release
+      script: |
+        APPLICATION="$APPLICATION-${RELEASE//./-}"
+        RELEASE_PLAN=$(cat $(results.release-plan.path))
+        SNAPSHOT=$(cat $(results.snapshot.path))
+        
+        RELEASE_NAME=$(kubectl get releases \
+          -l "release.appstudio.openshift.io/releasePlan=$RELEASE_PLAN,release.appstudio.openshift.io/snapshot=$SNAPSHOT" \
+          -o json | jq -r '.items[]
+          | . as $item
+          | ($item.status.conditions[]? | select(.type=="Released")) as $cond
+          | select( ($cond.status == "True") or ($cond.status == "False" and ($cond.reason // "") != "Failed"))
+          | $item.metadata.name '| head -n1 )
+        
+        if [[ -z $RELEASE_NAME ]]; then        
+          RELEASE_YAML=/tmp/release.yaml
+          cat <<EOF > $RELEASE_YAML
+        apiVersion: appstudio.redhat.com/v1alpha1
+        kind: Release
+        metadata:
+          generateName: release-$RELEASE_PLAN-
+        spec:
+          data:
+            mapping:
+              defaults:
+                tags: 
+                  - $(params.TAG)
+          releasePlan: $RELEASE_PLAN
+          snapshot: $SNAPSHOT
+        EOF
+        
+          cat $RELEASE_YAML
+          # Uncommented the execution so it actually creates the release
+          RELEASE_NAME=$(kubectl create -f $RELEASE_YAML -o jsonpath='{.metadata.name}')
+        fi
+        
+        echo -n "$RELEASE_NAME" | tee $(results.release.path)
+
+    - name: wait-for-release
+      script: |
+        APPLICATION="$APPLICATION-${RELEASE//./-}"
+        RELEASE_PLAN=$(cat $(results.release-plan.path))
+        SNAPSHOT=$(cat $(results.snapshot.path))
+        RELEASE_NAME=$(cat $(results.release.path))
+        
+        echo "Check the Release Status for: $RELEASE_NAME"
+        
+        release_status=$(
+          kubectl get release "$RELEASE_NAME" -o json | jq -r '.status.conditions[]? 
+            | select(.type == "Released") 
+            | .status'
+        )
+        echo "Status: $release_status"
+        
+        if [[ "$release_status" == "True" ]]; then
+          echo "$APPLICATION Release is Done on $ENVIRONMENT"
+          kubectl get release "$RELEASE_NAME" -o json | jq '.status.artifacts.advisory'
+        else
+          echo "Waiting for PipelineRun to be assigned to Release: $RELEASE_NAME..."
+          while true; do
+            # Attempt to extract the PipelineRun name from the Release status
+            export PIPELINERUN=$(kubectl get release "$RELEASE_NAME" -o jsonpath='{.status.managedProcessing.pipelineRun}' 2>/dev/null)
+        
+            # Check if the extracted string is not empty
+            if [ -n "$PIPELINERUN" ]; then
+              echo "Success! PipelineRun found: $PIPELINERUN"
+              break
+            fi
+            echo "PipelineRun Not yet Added. Retrying in 5s..."
+            sleep 5
+          done
+        
+          tkn -n "${PIPELINERUN%%/*}" pr logs -f "${PIPELINERUN##*/}"
+        
+          echo "Check Pipeline Run Status"
+          PIPELINERUN_STATUS=$(oc -n "${PIPELINERUN%%/*}" get pr "${PIPELINERUN##*/}" -o jsonpath="{.status.conditions[?(@.type=='Succeeded')]}")
+        
+          SUCCESS=$(echo "$PIPELINERUN_STATUS" | jq -r '.status')
+          MESSAGE=$(echo "$PIPELINERUN_STATUS" | jq -r '.message')
+        
+          if [[ "$SUCCESS" == "False" ]]; then
+            echo "PipelineRun $PIPELINERUN Failed: $MESSAGE"
+            exit 1 # Added an exit status to fail the Task properly if PR fails
+          else
+            echo "PipelineRun $PIPELINERUN Succeeded"
+          fi
+        fi

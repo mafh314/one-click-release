@@ -1,0 +1,117 @@
+---
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: openshift-pipelines-release
+  annotations:
+    tekton.dev/tags: release
+spec:
+  workspaces:
+    - name: source
+  params:
+    - name: RELEASE
+      default: "1.22"
+    - name: NEW_PATCH
+      default: "false"
+    - name: RELEASE_ACTION
+      default: ""
+    - name: TAG
+      default: "v1.22.2"
+    - name: ENVIRONMENT
+      type: string
+      default: "stage"
+    - name: INDEX_APPLICATIONS
+      default:
+        - openshift-pipelines-index-4-14
+        - openshift-pipelines-index-4-16
+        - openshift-pipelines-index-4-17
+        - openshift-pipelines-index-4-18
+        - openshift-pipelines-index-4-19
+        - openshift-pipelines-index-4-20
+        - openshift-pipelines-index-4-21
+        - openshift-pipelines-index-4-22
+        - openshift-pipelines-index-4-23
+        - openshift-pipelines-index-5-0
+    - name: REBUILD_COMPONENTS
+      default: [ "" ]
+  tasks:
+    - name: configure-release
+      workspaces:
+        - workspace: source
+          name: source
+      taskRef:
+        name: release-config-task
+      params:
+        - name: RELEASE
+          value: $(params.RELEASE)
+        - name: RELEASE_ACTION
+          value: $(params.RELEASE_ACTION)
+
+#    - name: process-hack-pull-requests
+#      runAfter:
+#        - configure-release
+#      taskRef:
+#        name: osp-github-pr-processor
+#      params:
+#        - name: SEARCH_LABEL
+#          value: "hack"
+#        - name: RELEASE
+#          value: $(params.RELEASE)
+
+    - name: apply-konflux-configuration
+      runAfter:
+        - configure-release
+      taskRef:
+        name: osp-github-pr-processor
+      params:
+        - name: SEARCH_LABEL
+          value: "hack"
+        - name: RELEASE
+          value: $(params.RELEASE)
+
+
+#        - name: release-core
+#          taskRef:
+#            name: konflux-release-task
+#          params:
+#            - name: APPLICATION
+#              value: openshift-pipelines-core
+#            - name: ENVIRONMENT
+#              value: $(params.ENVIRONMENT)
+#            - name: RELEASE
+#              value: $(params.RELEASE)
+#            - name: TAG
+#              value: $(params.TAG)
+
+#    - name: release-bundle
+##      runAfter:
+##        - release-core
+#      taskRef:
+#        name: konflux-release-task
+#      params:
+#        - name: APPLICATION
+#          value: openshift-pipelines-bundle
+#        - name: ENVIRONMENT
+#          value: $(params.ENVIRONMENT)
+#        - name: RELEASE
+#          value: $(params.RELEASE)
+#        - name: TAG
+#          value: $(params.TAG)
+#    - name: release-index
+#      #      runAfter:
+#      #        - release-bundle
+#      matrix:
+#        params:
+#          - name: APPLICATION
+#            value:
+#              - $(params.INDEX_APPLICATIONS)
+#      params:
+#        - name: ENVIRONMENT
+#          value: $(params.ENVIRONMENT)
+#        - name: RELEASE
+#          value: $(params.RELEASE)
+#        - name: TAG
+#          value: $(params.TAG)
+#      taskRef:
+#        name: konflux-release-task
+

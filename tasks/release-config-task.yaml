@@ -1,0 +1,157 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: release-config-task
+spec:
+  params:
+    - name: RELEASE
+      type: string
+    - name: RELEASE_ACTION
+      default: ""
+    - name: DRY_RUN
+      default: "false"
+    - name: REPO_URL
+      default: https://github.com/openshift-pipelines/hack
+    - name: REVISION
+      default: main
+    - name: github-token-secret
+      type: string
+      default: "github"
+      description: "Name of the secret containing the GitHub token"
+    - name: github-token-key
+      type: string
+      default: "github-token"
+  volumes:
+    - name: github-secret-volume
+      secret:
+        secretName: $(params.github-token-secret)
+    - name: shared-bin-dir
+      emptyDir: { }
+  results:
+    - name: release-plan
+      description: The release plan name
+    - name: snapshot
+      description: The snapshot name
+    - name: release
+      description: The created release name
+  stepTemplate:
+    workingDir: $(workspaces.source.path)/
+    image: quay.io/openshift-pipeline/ci:latest
+    volumeMounts:
+      - name: shared-bin-dir
+        mountPath: /shared-bin
+      - name: github-secret-volume
+        mountPath: /etc/github
+        readOnly: true
+
+    env:
+      - name: HOME
+        value: /shared-bin
+      - name: RELEASE
+        value: $(params.RELEASE)
+      - name: BIN_DIR
+        value: /shared-bin
+      - name: PATH
+        value: "/shared-bin:/usr/local/bin:/usr/bin"
+      - name: GH_TOKEN
+        valueFrom:
+          secretKeyRef:
+            name: $(params.github-token-secret)
+            key: $(params.github-token-key)
+
+  steps:
+    - name: install-dependencies
+      script: |
+        echo "# 1. Create a local bin directory if it doesn't already exist"
+        mkdir -p $BIN_DIR
+        cd  /tmp
+
+        echo "# 2. Fetch the latest version number from GitHub"
+        VERSION=$(curl -s "https://api.github.com/repos/cli/cli/releases/latest" | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+
+
+        GH_TAR_BALL=gh_${VERSION}_linux_amd64
+        echo "Using gh cli $$GH_TAR_BALL"
+
+        echo "# 3. Download the tarball"
+        curl -sLO "https://github.com/cli/cli/releases/download/v${VERSION}/$GH_TAR_BALL.tar.gz"
+
+        echo "# 4. Extract the tarball"
+        tar -xf $GH_TAR_BALL.tar.gz
+
+        # 5. Move the 'gh' binary to your local bin folder
+        cp "gh_${VERSION}_linux_amd64/bin/gh" $BIN_DIR
+
+        # 6. Clean up the downloaded files
+        rm -rf $GH_TAR_BALL*
+
+    - name: clone-repo
+      script: |
+        set -x
+        git clone -b $(params.REVISION) $(params.REPO_URL) repo
+
+    - name: new-release-action
+      env:
+        - name: RELEASE_ACTION
+          value: $(params.RELEASE_ACTION)
+      when:
+        - input: $(params.RELEASE_ACTION)
+          operator: in
+          values:
+            - "new-release"
+            - "new-patch"
+      script: |
+        set -x
+        cd repo
+        ./hack/release-manager.sh \
+        --action "$RELEASE_ACTION" \
+        --version "$RELEASE" 
+
+
+    - name: generate-konflux-config
+      description: |
+        Generate Konflux Config from Hack Repo
+      env:
+        - name: GOCACHE
+          value: $(workspaces.source.path)/.cache
+      script: |
+        gh auth setup-git
+        cd repo
+        go run ./cmd/konflux --version=$RELEASE --dry-run=$(params.DRY_RUN)
+
+    - name: commit-new-changes
+      #      when:
+      #        input: $(params.DRY_RUN)
+      #        operator: in
+      #        value: false
+      script: |
+        gh auth setup-git
+        cd repo
+        BASE_BRANCH=${GITHUB_REF#refs/heads/}
+        SOURCE_BRANCH=relase/$RELEASE/hack-update-konflux-config
+        git checkout -b ${SOURCE_BRANCH}
+        git add -f .konflux
+
+        if [[ -z $(git status --porcelain --untracked-files=no) ]]; then
+          echo "No change, exiting"
+          exit 0
+        fi
+
+        git commit -F- <<EOF
+          [bot:$RELEASE] Update Generated Konflux Config
+        EOF
+
+        git push -f origin ${SOURCE_BRANCH}
+
+        if [ "$(gh pr list --base ${BASE_BRANCH} --head ${SOURCE_BRANCH} --json url --jq 'length')" = "0" ]; then
+          echo "creating PR..."
+          gh pr create -B ${BASE_BRANCH} -H ${SOURCE_BRANCH} --label=automated --label=hack   --fill
+        fi
+    - name: apply-konflux-configuration
+      script: |
+        kubectl apply -Rf  ./repo/.konflux/openshift-pipelines/${RELEASE/./-}
+
+
+  workspaces:
+    - name: source
+

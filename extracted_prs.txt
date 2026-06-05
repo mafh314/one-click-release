@@ -1,0 +1,2 @@
+openshift-pipelines/operator https://github.com/openshift-pipelines/operator/pull/22580
+openshift-pipelines/p12n-console-plugin-pf5 https://github.com/openshift-pipelines/p12n-console-plugin-pf5/pull/15
