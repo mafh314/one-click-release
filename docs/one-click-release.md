@@ -117,7 +117,7 @@ The skill will mark the skipped step in the report and continue to the next one.
 
 ### Release CR Execution Pattern
 
-Steps that create Konflux Release CRs (2.6, 4.2, 4.6, 4.8) follow a specific pattern:
+Steps that create Konflux Release CRs (4.2, 4.6, 4.8, 4.9) follow a specific pattern:
 
 1. **Generate** — writes the Release YAML to `manifest/prod/`
 2. **Apply** — `oc create -f` (not `oc apply` — Release CRs use `generateName`)
@@ -152,9 +152,9 @@ Sets up all configuration before builds start. 13 steps across the hack repo, Ko
 
 **Typical duration:** 30 minutes to a few hours, depending on how many manual steps need attention.
 
-### Stage 2: Build (steps 2.1–2.7)
+### Stage 2: Build (steps 2.1–2.6)
 
-Processes release PRs, waits for Konflux snapshots, handles the nudge/OLM/FBC pipeline, releases CLI to CDN, and sets code freeze.
+Processes release PRs, waits for Konflux snapshots, handles the nudge/OLM/FBC pipeline, and sets code freeze.
 
 **Typical duration:** 1–3 hours. Most time is spent waiting for Konflux builds (5–15 min each) and workflow runs.
 
@@ -164,9 +164,9 @@ Extracts index image digests and copies them to quay.io for QE.
 
 **Typical duration:** 5–10 minutes.
 
-### Stage 4: Production Release (steps 4.1–4.8)
+### Stage 4: Production Release (steps 4.1–4.9)
 
-Releases core, bundle, and index to production. Requires explicit gate confirmation before starting.
+Releases core, bundle, index, and CLI binaries to production. Requires explicit gate confirmation before starting.
 
 **Typical duration:** 1–2 hours. Release pipelines take 10–30 minutes each. The non-blocking 300s wait means you don't have to watch — re-run to check status.
 
@@ -231,11 +231,11 @@ Key properties:
 
 **Session 1 (morning):** Config stage completes. Build stage starts, processes release PRs. Stops at step 2.2 (waiting for builds). Close terminal.
 
-**Session 2 (30 min later):** Steps 1.1–2.1 verify as DONE instantly. Proceed through nudge PRs, OLM render, FBC builds. CDN release started. Close terminal.
+**Session 2 (30 min later):** Steps 1.1–2.1 verify as DONE instantly. Proceed through nudge PRs, OLM render, FBC builds. Close terminal.
 
 **Session 3 (next day):** Everything through Stage 3 is DONE. Hand off to QE.
 
-**Session 4 (after QE approval):** Confirm production gate. Proceed through core, bundle, index releases.
+**Session 4 (after QE approval):** Confirm production gate. Proceed through core, bundle, index releases, then CDN production release (step 4.9).
 
 ---
 
@@ -298,4 +298,4 @@ oc get release {NAME} -n tekton-ecosystem-tenant \
 
 **Symptom:** Need to land a fix on the release branch, but `update-sources` is disabled.
 
-**Fix:** Temporarily unset code freeze in the hack config, land the fix, wait for the build, re-set freeze (step 2.7).
+**Fix:** Temporarily unset code freeze in the hack config, land the fix, wait for the build, re-set freeze (step 2.6).

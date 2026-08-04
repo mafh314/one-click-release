@@ -28,9 +28,9 @@ The process has four stages:
 | Stage | Steps | Purpose |
 |-------|-------|---------|
 | **Config** | 1.1–1.13 | Set up all configuration across repos and systems before any builds start |
-| **Build** | 2.1–2.7 | Build all component images, render OLM catalogs, release CLI to CDN, freeze code |
+| **Build** | 2.1–2.6 | Build all component images, render OLM catalogs, freeze code |
 | **Image Copy** | 3.1–3.2 | Copy index images to quay.io for QE testing |
-| **Production Release** | 4.1–4.8 | Release core, bundle, and index images to production registries |
+| **Production Release** | 4.1–4.9 | Release core, bundle, index, and CLI binaries to production registries |
 
 Steps within each stage are sequential — later steps depend on earlier ones. You cannot skip ahead.
 
@@ -284,7 +284,7 @@ Everything needed before builds can start. This is the longest stage because the
 
 ## Stage 2: Build
 
-Build all component images, render OLM catalogs for staging, release CLI to CDN, and freeze the release branch.
+Build all component images, render OLM catalogs for staging, and freeze the release branch.
 
 ---
 
@@ -328,7 +328,7 @@ Build all component images, render OLM catalogs for staging, release CLI to CDN,
 **Risks:**
 - Nudge PRs arrive in waves as each component finishes. May need multiple passes.
 - CI failures are often transient — retesting usually resolves them.
-- Conflicts between concurrent nudge PRs — merge one at a time.
+- **Conflicting PRs:** When earlier nudge merges update `project.yaml`, remaining open nudge PRs go stale. The skill classifies these as `CONFLICTING` and handles them by extracting each PR's SHA changes, cloning the branch, applying all updates in one commit, creating a consolidated PR, and closing the originals. Requires approval before the clone and push steps.
 
 **Auto-trigger warning:** Merging nudge PRs pushes `project.yaml`, which auto-triggers `operator-update-images` with devel environment (wrong registry). This is expected — step 2.4 dispatches the correct staging run.
 
@@ -365,21 +365,7 @@ Build all component images, render OLM catalogs for staging, release CLI to CDN,
 
 ---
 
-### Step 2.6: CDN production release
-
-**What:** Creates a Konflux Release CR releasing CLI binaries to the Red Hat developer download portal.
-
-**Why:** CLI binaries ship separately from container images. Users download them from CDN.
-
-**Done when:** CDN production release exists with status `Succeeded`.
-
-**Why production directly (not stage first):** Stage CDN requires manual product version configuration in the stage CDN environment. Going directly to production with `invisible: true` skips this. After the release succeeds, update the product version YAML to set `invisible: false`.
-
-**Risks:** Core snapshot must be verified first (step 2.2). Pipeline failures are typically RPA/RP config issues (steps 1.12–1.13).
-
----
-
-### Step 2.7: Code freeze
+### Step 2.6: Code freeze
 
 **What:** Sets `code-freeze: true` in the hack release config.
 
@@ -511,6 +497,20 @@ Release core, bundle, and index applications to production via Konflux Release C
 
 ---
 
+### Step 4.9: CDN production release
+
+**What:** Creates a Konflux Release CR releasing CLI binaries to the Red Hat developer download portal, using the snapshot from the succeeded core production release (step 4.2).
+
+**Why:** CLI binaries ship separately from container images. Users download them from CDN. Running this after core production (rather than during Stage 2) ensures the CDN release uses the same validated snapshot that went to production.
+
+**Done when:** CDN production release exists with status `Succeeded`.
+
+**Why production directly (not stage first):** Stage CDN requires manual product version configuration in the stage CDN environment. Going directly to production with `invisible: true` skips this. After the release succeeds, update the product version YAML to set `invisible: false`.
+
+**Risks:** Core production release (step 4.2) must succeed first — the CDN release uses that snapshot. Pipeline failures are typically RPA/RP config issues (steps 1.12–1.13).
+
+---
+
 ## Dependency Chains
 
 ### Within Stage 1 (Config)
@@ -528,15 +528,15 @@ Steps 1.5–1.13 are independent of 1.1–1.4 and could theoretically run in par
 ### Within Stage 2 (Build)
 
 ```
-2.1 (release PRs) -> 2.2 (core snapshot) -> 2.3 (nudge PRs) -> 2.4 (OLM render) -> 2.5 (FBC builds) -> 2.7 (code freeze)
-                     |
-                     2.6 (CDN release -- uses core snapshot)
+2.1 (release PRs) -> 2.2 (core snapshot) -> 2.3 (nudge PRs) -> 2.4 (OLM render) -> 2.5 (FBC builds) -> 2.6 (code freeze)
 ```
 
 ### Within Stage 4 (Production Release)
 
 ```
 4.1 (verify stage) -> 4.2 (core prod) -> 4.3 (CSV update) -> 4.4 (merge CSV PR) -> 4.5 (bundle snapshot) -> 4.6 (bundle prod) -> 4.7 (OLM render + index) -> 4.8 (index prod)
+                      |
+                      4.9 (CDN release -- uses core prod snapshot)
 ```
 
 ### Cross-stage dependencies
@@ -546,7 +546,7 @@ These constraints cross stage boundaries. Violating them leads to broken builds 
 | Must complete | Before | Why |
 |---------------|--------|-----|
 | 1.4 (config on cluster) | 2.1 (release PRs) | Pipelines triggered by release PRs fail without cluster config |
-| 1.7 (OLM bundle version) | 2.7 (code freeze) | `update-sources` is disabled during freeze; can't update olm/config.yaml |
+| 1.7 (OLM bundle version) | 2.6 (code freeze) | `update-sources` is disabled during freeze; can't update olm/config.yaml |
 | 1.8 (operator project.yaml) | 2.2 (core snapshot) | Images built without version bump ship wrong version string |
 | 1.12 (CLI product version) | 1.13 (CLI CDN RP/RPA) | RPA references a version that must already exist |
 | Stage 2 complete | Stage 3 | All snapshots must be current before copying images |
@@ -574,7 +574,7 @@ If step 1.7 (OLM bundle version) is missed, `render-olm-catalog` produces empty 
 
 ### Nudge PR conflicts
 
-Multiple nudge PRs targeting the same `project.yaml` lines can conflict. Merge one at a time and rebase the rest.
+Multiple nudge PRs targeting the same `project.yaml` lines conflict when an earlier merge makes the remaining PRs' base stale. The skill handles this automatically: it merges all READY PRs first, then identifies conflicting ones, extracts their SHA changes, applies them to a fresh clone of the release branch, and creates a single consolidated PR. The original conflicting PRs are closed with a superseded comment. Requires approval before cloning and pushing.
 
 ### Stale snapshots after manual fixes
 

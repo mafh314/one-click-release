@@ -875,7 +875,7 @@ Notes:
 - `ga`: `false` for patch versions, `true` for minor releases and patches on latest minor
 - `releaseDate`: set to actual release date
 
-Reference MR: `https://gitlab.cee.redhat.com/releng/konflux-release-data/-/merge_requests/14753`
+Reference MR: `https://gitlab.cee.redhat.com/releng/konflux-release-data/-/merge_requests/20810`
 
 **IMPORTANT:** This PR must be merged BEFORE creating the RP/RPA in step 1.12.
 

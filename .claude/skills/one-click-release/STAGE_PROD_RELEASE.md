@@ -847,6 +847,103 @@ If all `Released=True` → DONE. If any are still in progress, report which ones
 
 ---
 
+## Step 4.9: CDN production release
+
+After the core production release succeeds (step 4.2), CLI binaries can be released to CDN. This step creates a Konflux Release CR targeting the CDN production release plan, using the snapshot from the succeeded core production release.
+
+Stage release of the binaries requires manual product version configuration in stage CDN, so go directly to production release while keeping the `invisible` flag set to `true` in the product version YAML.
+
+**Requires:** `KONFLUX_SERVER` and `KONFLUX_TOKEN`. If missing, SKIP this step.
+
+### Verify
+
+Check for existing CDN releases:
+```bash
+oc get releases -n ${KONFLUX_NS} \
+  --server="$KONFLUX_SERVER" --token="$KONFLUX_TOKEN" \
+  --insecure-skip-tls-verify 2>&1 | grep -E "${MM_DASHED}.*(cdn-prod)"
+```
+
+If a CDN release exists, check its status (look for `Succeeded` vs `Failed`).
+
+Get the snapshot from the succeeded core production release (step 4.2):
+```bash
+PROD_CORE_SNAPSHOT=$(oc get releases -n ${KONFLUX_NS} \
+  --server="$KONFLUX_SERVER" --token="$KONFLUX_TOKEN" \
+  --insecure-skip-tls-verify -o json 2>/dev/null \
+  | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+mm = '${MM_DASHED}'
+for item in data.get('items', []):
+    rp = item.get('spec', {}).get('releasePlan', '')
+    if mm in rp and 'core' in rp and 'prod' in rp and 'cdn' not in rp:
+        conditions = item.get('status', {}).get('conditions', [])
+        released = next((c for c in conditions if c.get('type') == 'Released'), {})
+        if released.get('status') == 'True':
+            print(item['spec']['snapshot'])
+            break
+")
+echo "Core prod snapshot: ${PROD_CORE_SNAPSHOT}"
+```
+
+**Collect links:** Report the snapshot name and any existing CDN release status.
+
+**Expected when DONE:** A CDN production release exists with status `Succeeded`.
+
+### If not done — Execute (requires approval)
+
+Write the Release YAML to `${REPORT_BASE}/manifest/prod/release-${VERSION}-cdn-prod.yaml`:
+```bash
+mkdir -p "${REPORT_BASE}/manifest/prod"
+
+cat > "${REPORT_BASE}/manifest/prod/release-${VERSION}-cdn-prod.yaml" <<EOF
+apiVersion: appstudio.redhat.com/v1alpha1
+kind: Release
+metadata:
+  labels:
+    appstudio.openshift.io/application: openshift-pipelines-core-${MM_DASHED}
+  generateName: openshift-pipelines-${MM_DASHED}-core-cdn-prod-release-
+  namespace: ${KONFLUX_NS}
+spec:
+  data:
+  gracePeriodDays: 10
+  releasePlan: openshift-pipelines-${MM_DASHED}-core-cdn-prod
+  snapshot: ${PROD_CORE_SNAPSHOT}
+EOF
+```
+
+Apply the Release CR (`oc create`, not `oc apply` — uses `generateName`):
+```bash
+RELEASE_NAME=$(oc create -f ${REPORT_BASE}/manifest/prod/release-${VERSION}-cdn-prod.yaml \
+  --server="$KONFLUX_SERVER" --token="$KONFLUX_TOKEN" \
+  --insecure-skip-tls-verify \
+  -o jsonpath='{.metadata.name}')
+echo "Created release: ${RELEASE_NAME}"
+```
+
+Wait for the release to complete:
+```bash
+oc wait release/${RELEASE_NAME} -n ${KONFLUX_NS} \
+  --server="$KONFLUX_SERVER" --token="$KONFLUX_TOKEN" \
+  --insecure-skip-tls-verify \
+  --for=condition=Released --timeout=300s 2>&1 || true
+```
+
+Check result:
+```bash
+oc get release ${RELEASE_NAME} -n ${KONFLUX_NS} \
+  --server="$KONFLUX_SERVER" --token="$KONFLUX_TOKEN" \
+  --insecure-skip-tls-verify \
+  -o jsonpath='Released={.status.conditions[?(@.type=="Released")].status} Reason={.status.conditions[?(@.type=="Released")].reason}'
+```
+
+If `Released=True` → DONE. If still in progress (condition not yet set or `Unknown`), report the release name and move on — the re-verify will catch it on the next run.
+
+After the release succeeds, update the product version YAML to set `invisible: false`.
+
+---
+
 ## Report Output
 
 After processing all steps, write the stage report to `${REPORT_BASE}/release/report_${REPORT_TIMESTAMP}.md`.
@@ -872,6 +969,7 @@ After processing all steps, write the stage report to `${REPORT_BASE}/release/re
 | 4.6 | Bundle production release | {status} | {details} | {links} |
 | 4.7 | OLM catalog render + index snapshots | {status} | {details} | {links} |
 | 4.8 | Index production releases | {status} | {details} | {links} |
+| 4.9 | CDN production release | {status} | {details} | {links} |
 
 ## Release Manifests
 
@@ -882,6 +980,7 @@ All generated Release CR YAMLs:
 | release-${VERSION}-core-prod.yaml | {app} | {rp} | {snapshot} |
 | release-${VERSION}-bundle-prod.yaml | {app} | {rp} | {snapshot} |
 | release-${VERSION}-index-{ocp}-prod.yaml | {app} | {rp} | {snapshot} |
+| release-${VERSION}-cdn-prod.yaml | openshift-pipelines-core-${MM_DASHED} | openshift-pipelines-${MM_DASHED}-core-cdn-prod | {snapshot} |
 
 ## Step Details
 
@@ -942,6 +1041,13 @@ All generated Release CR YAMLs:
 | {app} | {rp} | {snapshot} | {Succeeded/Failed/not found} |
 
 - **Manifests:** release-${VERSION}-index-*-prod.yaml
+
+### Step 4.9: CDN production release
+- **Status:** {DONE | ACTION NEEDED | SKIPPED}
+- **Release:** {name} — {Succeeded/Failed/not found}
+- **Release Plan:** openshift-pipelines-${MM_DASHED}-core-cdn-prod
+- **Snapshot:** {snapshot} (from core prod release)
+- **Manifest:** release-${VERSION}-cdn-prod.yaml
 
 {...include details for each step checked...}
 

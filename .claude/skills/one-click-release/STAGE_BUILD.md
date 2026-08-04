@@ -304,10 +304,16 @@ gh search prs --owner openshift-pipelines \
   "label:konflux-nudge" 2>/dev/null
 ```
 
-For each open nudge PR, check its CI status:
+For each open nudge PR, check its merge and CI status:
 ```bash
 gh pr view "${PR_URL}" --json mergeable,mergeStateStatus,statusCheckRollup
 ```
+
+Classify each PR:
+- `mergeable: MERGEABLE` + all CI passing → **READY TO MERGE**
+- `mergeable: CONFLICTING` or `mergeStateStatus: DIRTY` → **CONFLICTING** (needs consolidation)
+- CI checks with `bucket: fail` → **CI FAILING**
+- CI checks with `bucket: pending` → **CI PENDING**
 
 Also check recently merged nudge PRs to report progress:
 ```bash
@@ -341,7 +347,115 @@ Report the failing checks. If the failure is a known transient issue, suggest `/
 gh pr comment "${PR_URL}" --body "/retest"
 ```
 
-After merging, re-verify to confirm no open nudge PRs remain.
+#### Consolidating conflicting nudge PRs
+
+After merging all READY nudge PRs and retesting CI failures, re-check for remaining open nudge PRs with `mergeable: CONFLICTING` status. These arise when earlier nudge merges changed `project.yaml`, making the remaining PRs' base stale.
+
+**Step 1 — Identify conflicting nudge PRs and extract their SHA changes:**
+```bash
+CONFLICTING_PRS=$(gh pr list --repo openshift-pipelines/operator \
+  --base ${RELEASE_BRANCH} \
+  --label konflux-nudge \
+  --state open --limit 50 \
+  --json number,url,title,mergeable \
+  --jq '[.[] | select(.mergeable == "CONFLICTING")] | .[] | "\(.number) \(.url) \(.title)"')
+```
+
+If no conflicting PRs remain, skip to re-verify.
+
+For each conflicting PR, extract the image name and new SHA from the diff. Nudge PRs change a single line in `project.yaml` — the image reference SHA:
+```bash
+gh pr diff --repo openshift-pipelines/operator ${PR_NUMBER} 2>/dev/null \
+  | grep -E '^\+.*@sha256:' \
+  | head -5
+```
+
+The added lines (`+`) show the new SHA for each image. Parse the image name (the part before `@sha256:`) and the new digest (the part after `@sha256:`). Collect all `(image_name, new_sha)` pairs across all conflicting PRs.
+
+**Step 2 — Clone and apply changes (requires approval):**
+
+Show the user: "N conflicting nudge PRs found. Create consolidated PR with the following SHA updates?" followed by the list of image→SHA mappings. Execute only after approval.
+
+```bash
+TMP_DIR=$(mktemp -d)
+gh repo clone "openshift-pipelines/operator" "${TMP_DIR}" -- -b "${RELEASE_BRANCH}" --depth 1 --quiet
+cd "${TMP_DIR}"
+
+EXPECTED_HEAD=$(git ls-remote origin "refs/heads/${RELEASE_BRANCH}" | awk '{print $1}')
+ACTUAL_HEAD=$(git rev-parse HEAD)
+echo "Release branch HEAD: ${EXPECTED_HEAD:0:12}  Clone HEAD: ${ACTUAL_HEAD:0:12}"
+if [ "${EXPECTED_HEAD}" != "${ACTUAL_HEAD}" ]; then
+  echo "ERROR: clone is not at release branch HEAD — aborting"
+  exit 1
+fi
+
+git config user.name "${GITHUB_USER:-One Click Release Bot}"
+git config user.email "${GITHUB_EMAIL:-one-click-release-bot@redhat.com}"
+```
+
+For each `(image_name, new_sha)` pair, substitute only the SHA portion in `project.yaml`, preserving the registry prefix:
+```bash
+sed -i "s|\(${IMAGE_NAME}@sha256:\)[a-f0-9]\{64\}|\1${NEW_SHA}|g" project.yaml
+```
+
+Verify the changes are correct — only SHA digests should differ:
+```bash
+git diff project.yaml
+```
+
+**Step 3 — Push and create consolidated PR:**
+```bash
+CONSOLIDATED_BRANCH="one-click-release/consolidated-nudge-${VERSION}"
+git checkout -b "${CONSOLIDATED_BRANCH}"
+git add project.yaml
+git commit -m "chore(deps): consolidated nudge updates for ${VERSION}
+
+Combines SHA updates from conflicting nudge PRs:
+$(for PR_NUM in ${CONFLICTING_PR_NUMBERS}; do echo "- #${PR_NUM}"; done)"
+git push origin "${CONSOLIDATED_BRANCH}" --quiet
+cd -
+```
+
+Create the PR:
+```bash
+BODY="Consolidated nudge PR combining SHA updates from conflicting nudge PRs:
+$(for PR_NUM in ${CONFLICTING_PR_NUMBERS}; do echo "- #${PR_NUM}"; done)
+
+These PRs had merge conflicts because earlier nudge PRs changed \`project.yaml\` first.
+This PR applies all remaining SHA updates against the current branch HEAD."
+
+gh pr create --repo openshift-pipelines/operator \
+  --base "${RELEASE_BRANCH}" \
+  --head "${CONSOLIDATED_BRANCH}" \
+  --title "chore(deps): consolidated nudge updates for ${VERSION}" \
+  --body "${BODY}" \
+  --label "konflux-nudge,lgtm,approved,one-click-release"
+```
+
+**Step 4 — Close original conflicting PRs:**
+```bash
+for PR_NUM in ${CONFLICTING_PR_NUMBERS}; do
+  gh pr close --repo openshift-pipelines/operator ${PR_NUM} \
+    --comment "Superseded by consolidated nudge PR. SHA update included in the consolidated PR."
+done
+```
+
+**Step 5 — Merge the consolidated PR:**
+```bash
+CONSOLIDATED_PR=$(gh pr list --repo openshift-pipelines/operator \
+  --head "${CONSOLIDATED_BRANCH}" \
+  --state open --limit 1 \
+  --json number --jq '.[0].number')
+gh pr review --approve --repo openshift-pipelines/operator ${CONSOLIDATED_PR}
+gh pr merge --repo openshift-pipelines/operator ${CONSOLIDATED_PR} -d -r --auto
+```
+
+Wait for CI and merge to complete, then clean up:
+```bash
+rm -rf "${TMP_DIR}"
+```
+
+After merging (or after all READY PRs merged if no conflicts), re-verify to confirm no open nudge PRs remain.
 
 **Registry prefix preservation:** Nudge PRs only change image SHA digests — they do NOT change the registry prefix. For example, a nudge PR changes `registry.stage.redhat.io/osp-stage/image@sha256:OLD` to `registry.stage.redhat.io/osp-stage/image@sha256:NEW` — the `registry.stage.redhat.io` prefix must be preserved. If consolidating multiple nudge PRs into one, use sed to substitute only the SHA portion (the part after `@sha256:`), not the full image reference. Never replace the registry prefix.
 
@@ -865,102 +979,7 @@ for item in data.get('items', []):
 
 ---
 
-## Step 2.9: CDN production release
-
-After the core snapshot is verified (step 2.2) and core stage release succeeds (step 2.3), CLI binaries can be released to CDN. This step creates a Konflux Release CR targeting the CDN release plan.
-
-Stage release of the binaries requires manual product version configuration in stage CDN, so go directly to production release while keeping the `invisible` flag set to `true` in the product version YAML.
-
-**Requires:** `KONFLUX_SERVER` and `KONFLUX_TOKEN`. If missing, SKIP this step.
-
-### Verify
-
-Check for existing CDN releases:
-```bash
-oc get releases -n ${KONFLUX_NS} \
-  --server="$KONFLUX_SERVER" --token="$KONFLUX_TOKEN" \
-  --insecure-skip-tls-verify 2>&1 | grep -E "${MM_DASHED}.*(cdn-prod)"
-```
-
-If a CDN release exists, check its status (look for `Succeeded` vs `Failed`).
-
-Get the latest core snapshot:
-```bash
-oc get snapshot -n ${KONFLUX_NS} \
-  --server="$KONFLUX_SERVER" --token="$KONFLUX_TOKEN" \
-  --insecure-skip-tls-verify \
-  -o jsonpath="{range .items[*]} {.metadata.creationTimestamp}{'\t'} {.metadata.labels.pac\.test\.appstudio\.openshift\.io\/event-type}{'\t'} {.metadata.name} {'\n'}{end}" \
-  --sort-by=.metadata.creationTimestamp \
-  -l "pac.test.appstudio.openshift.io/event-type=push,appstudio.openshift.io/application=openshift-pipelines-core-${MM_DASHED}" \
-  2>/dev/null | tail -5
-```
-
-**Collect links:** Report the latest snapshot name and any existing CDN release status.
-
-**Expected when DONE:** A CDN production release exists with status `Succeeded`.
-
-### If not done — Execute (requires approval)
-
-Generate and apply a Release CR.
-
-Get the latest core snapshot:
-```bash
-LATEST_SNAPSHOT=$(oc get snapshots -n ${KONFLUX_NS} \
-  --server="$KONFLUX_SERVER" --token="$KONFLUX_TOKEN" \
-  --insecure-skip-tls-verify \
-  -l "pac.test.appstudio.openshift.io/event-type=push,appstudio.openshift.io/application=openshift-pipelines-core-${MM_DASHED}" \
-  --sort-by=.metadata.creationTimestamp \
-  -o jsonpath='{.items[*].metadata.name}' 2>/dev/null | awk '{print $NF}')
-```
-
-Write the Release YAML to `${REPORT_BASE}/manifest/prod/release-${VERSION}-cdn-prod.yaml`:
-```yaml
-apiVersion: appstudio.redhat.com/v1alpha1
-kind: Release
-metadata:
-  labels:
-    appstudio.openshift.io/application: openshift-pipelines-core-${MM_DASHED}
-  generateName: openshift-pipelines-${MM_DASHED}-core-cdn-prod-release-
-  namespace: tekton-ecosystem-tenant
-spec:
-  data:
-  gracePeriodDays: 10
-  releasePlan: openshift-pipelines-${MM_DASHED}-core-cdn-prod
-  snapshot: ${LATEST_SNAPSHOT}
-```
-
-Apply the Release CR (`oc create`, not `oc apply` — uses `generateName`):
-```bash
-RELEASE_NAME=$(oc create -f ${REPORT_BASE}/manifest/prod/release-${VERSION}-cdn-prod.yaml \
-  --server="$KONFLUX_SERVER" --token="$KONFLUX_TOKEN" \
-  --insecure-skip-tls-verify \
-  -o jsonpath='{.metadata.name}')
-echo "Created release: ${RELEASE_NAME}"
-```
-
-Wait for the release to complete:
-```bash
-oc wait release/${RELEASE_NAME} -n ${KONFLUX_NS} \
-  --server="$KONFLUX_SERVER" --token="$KONFLUX_TOKEN" \
-  --insecure-skip-tls-verify \
-  --for=condition=Released --timeout=300s 2>&1 || true
-```
-
-Check result:
-```bash
-oc get release ${RELEASE_NAME} -n ${KONFLUX_NS} \
-  --server="$KONFLUX_SERVER" --token="$KONFLUX_TOKEN" \
-  --insecure-skip-tls-verify \
-  -o jsonpath='Released={.status.conditions[?(@.type=="Released")].status} Reason={.status.conditions[?(@.type=="Released")].reason}'
-```
-
-If `Released=True` → DONE. If still in progress (condition not yet set or `Unknown`), report the release name and move on — the re-verify will catch it on the next run.
-
-After the release succeeds, update the product version YAML to set `invisible: false`.
-
----
-
-## Step 2.10: Code freeze
+## Step 2.9: Code freeze
 
 The `code-freeze` field in the hack release config should be set to `true` when builds are complete and index stage releases have succeeded (step 2.8) — this is when index images are ready for QE testing.
 
@@ -1052,8 +1071,7 @@ After processing all steps, write the stage report to `${REPORT_BASE}/build/repo
 | 2.6 | Wait for FBC build | {status} | {details} | {links} |
 | 2.7 | Bundle stage release | {status} | {details} | {links} |
 | 2.8 | Index stage releases | {status} | {details} | {links} |
-| 2.9 | CDN production release | {status} | {details} | {links} |
-| 2.10 | Code freeze | {status} | {details} | {links} |
+| 2.9 | Code freeze | {status} | {details} | {links} |
 
 ## Step Details
 
@@ -1081,8 +1099,9 @@ After processing all steps, write the stage report to `${REPORT_BASE}/build/repo
 
 ### Step 2.4: Process nudge PRs
 - **Status:** {DONE | ACTION NEEDED | SKIPPED}
-- **Open nudge PRs:** {count}
-- **Merged nudge PRs:** {count}
+- **Merged:** {count} nudge PRs merged
+- **Closed:** {count} conflicting nudge PRs closed (superseded by consolidated PR)
+- **Consolidated PR:** operator [#NUM](URL) — {merged/open} (only if consolidation was needed)
 - **Details:** {per-PR status if any open}
 
 ### Step 2.5: OLM catalog render
@@ -1116,12 +1135,7 @@ After processing all steps, write the stage report to `${REPORT_BASE}/build/repo
 
 - **Manifests:** manifest/stage/release-{VERSION}-index-*-stage.yaml
 
-### Step 2.9: CDN production release
-- **Status:** {DONE | ACTION NEEDED | SKIPPED}
-- **CDN release:** {name} — {Succeeded/Failed/not found}
-- **Snapshot:** {name}
-
-### Step 2.10: Code freeze
+### Step 2.9: Code freeze
 - **Status:** {DONE | ACTION NEEDED | SKIPPED}
 - **code-freeze:** {true/false}
 - **PR:** hack [#{number}]({url}) — {state}
